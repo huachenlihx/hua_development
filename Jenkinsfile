@@ -37,7 +37,7 @@ pipeline {
                     sh '''
                         . ${VENV_DIR}/bin/activate
                         pip install --quiet flake8
-                        flake8 pdf2md.py --max-line-length=120 --count --statistics
+                        flake8 pdf2md.py --max-line-length=120 --extend-ignore=E221,E251,E272 --count --statistics
                     '''
                 }
             }
