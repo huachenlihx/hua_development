@@ -1,0 +1,11 @@
+# pdf2md — PDF to Markdown converter
+# Install with:  pip install -r requirements.txt
+
+# PDF reading, text extraction, table detection, font metadata
+pdfplumber>=0.11.0
+
+# PDF annotation access (links) and raw image XObject extraction
+pypdf>=4.0.0
+
+# Image reconstruction and lossless PNG saving
+Pillow>=10.0.0
