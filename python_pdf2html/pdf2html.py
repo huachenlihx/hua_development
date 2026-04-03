@@ -1,12 +1,10 @@
 #!/usr/bin/env python3
 """
-pdf2html.py — Convert a PDF file to a self-contained HTML file.
-Optimised for large PDFs (1 000+ pages) using:
-  • Parallel page rendering  (ProcessPoolExecutor)
-  • Incremental progress bar in the terminal
-  • Virtual / lazy HTML — pages are placeholders until they scroll into view
-  • Intersection Observer renders images only when needed in the browser
-  • Page-jump navigation and keyboard shortcuts in the viewer
+pdf2html.py — Convert a PDF file to a fully self-contained single HTML file.
+
+All pages are rendered to WebP and embedded as base64 data URIs directly
+inside the HTML — no external resources folder, no separate image files.
+The output is a single .html file you can share, email, or open anywhere.
 
 Usage:
     python3 pdf2html.py <path/to/file.pdf> [options]
@@ -15,17 +13,14 @@ Options:
     --dpi INT        Render resolution (default: 150)
     --quality INT    WebP quality 0-100 (default: 85)
     --workers INT    Parallel render workers (default: CPU count)
-    --skip-images    Skip extracting embedded images (faster for huge PDFs)
 
 Output:
     <same folder as PDF>/
-        <filename>.html          <- open this in your browser
-        resources/
-            page_0001.webp       <- page renders (zero-padded for 9999 pages)
-            img_0001.webp        <- embedded images
+        <filename>.html    <- single self-contained file, no dependencies
 """
 
 import argparse
+import base64
 import concurrent.futures
 import json
 import sys
@@ -48,10 +43,6 @@ DEFAULT_WORKERS = None   # None -> os.cpu_count()
 # Helpers
 # ---------------------------------------------------------------------------
 
-def ensure_dir(path: Path) -> None:
-    path.mkdir(parents=True, exist_ok=True)
-
-
 def pixmap_to_webp_bytes(pix: fitz.Pixmap, quality: int) -> bytes:
     """Pixmap -> in-memory WebP bytes (no temp file)."""
     if pix.n - pix.alpha > 3:           # CMYK / exotic colour space
@@ -64,34 +55,38 @@ def pixmap_to_webp_bytes(pix: fitz.Pixmap, quality: int) -> bytes:
     return buf.getvalue()
 
 
+def webp_bytes_to_data_uri(data: bytes) -> str:
+    """Convert raw WebP bytes to a base64 data URI string."""
+    b64 = base64.b64encode(data).decode("ascii")
+    return f"data:image/webp;base64,{b64}"
+
+
 # ---------------------------------------------------------------------------
-# Worker function -- must be top-level for multiprocessing pickling
+# Worker function — must be top-level for multiprocessing pickling
 # ---------------------------------------------------------------------------
 
 def _render_page_worker(args: tuple) -> tuple:
     """
-    Render one page and write WebP to disk.
-    Returns (page_index, width_px, height_px).
+    Render one page to WebP bytes in memory.
+    Returns (page_index, width_px, height_px, webp_bytes).
     """
-    pdf_path_str, page_index, dest_str, dpi, quality = args
-    doc = fitz.open(pdf_path_str)
+    pdf_path_str, page_index, dpi, quality = args
+    doc  = fitz.open(pdf_path_str)
     page = doc[page_index]
-    mat = fitz.Matrix(dpi / 72, dpi / 72)
-    pix = page.get_pixmap(matrix=mat, alpha=False)
+    mat  = fitz.Matrix(dpi / 72, dpi / 72)
+    pix  = page.get_pixmap(matrix=mat, alpha=False)
     w, h = pix.width, pix.height
     data = pixmap_to_webp_bytes(pix, quality)
     doc.close()
-    Path(dest_str).write_bytes(data)
-    return page_index, w, h
+    return page_index, w, h, data
 
 
 # ---------------------------------------------------------------------------
-# Parallel page rendering
+# Parallel page rendering — returns base64 data URIs, no disk writes
 # ---------------------------------------------------------------------------
 
 def render_pages_parallel(
     pdf_path: Path,
-    resources_dir: Path,
     total_pages: int,
     dpi: int,
     quality: int,
@@ -99,16 +94,12 @@ def render_pages_parallel(
 ) -> list:
     """
     Render all pages in parallel.
-    Returns list of {path, width, height} dicts indexed by page number.
+    Returns list of {src, width, height} dicts where src is a base64 data URI.
     """
-    pad = len(str(total_pages))   # e.g. 4 digits for 1000-page PDF
-
-    tasks = []
-    dest_paths = []
-    for i in range(total_pages):
-        dest = resources_dir / f"page_{i + 1:0{pad}d}.webp"
-        dest_paths.append(dest)
-        tasks.append((str(pdf_path), i, str(dest), dpi, quality))
+    tasks = [
+        (str(pdf_path), i, dpi, quality)
+        for i in range(total_pages)
+    ]
 
     results = [None] * total_pages
 
@@ -116,44 +107,17 @@ def render_pages_parallel(
         futures = {pool.submit(_render_page_worker, t): idx for idx, t in enumerate(tasks)}
         done = 0
         for fut in concurrent.futures.as_completed(futures):
-            page_index, w, h = fut.result()
-            results[page_index] = {"path": dest_paths[page_index], "width": w, "height": h}
+            page_index, w, h, data = fut.result()
+            results[page_index] = {
+                "src":    webp_bytes_to_data_uri(data),
+                "width":  w,
+                "height": h,
+            }
             done += 1
             _progress("Rendering pages", done, total_pages)
 
     print()   # newline after progress bar
     return results
-
-
-# ---------------------------------------------------------------------------
-# Embedded image extraction
-# ---------------------------------------------------------------------------
-
-def extract_embedded_images(
-    doc: fitz.Document,
-    resources_dir: Path,
-    total_pages: int,
-    quality: int,
-) -> None:
-    """Extract unique raster images from the PDF and save as WebP."""
-    seen = set()
-    counter = 1
-    pad = len(str(total_pages))
-
-    for page in doc:
-        for img_info in page.get_images(full=True):
-            xref = img_info[0]
-            if xref in seen:
-                continue
-            seen.add(xref)
-            try:
-                pix = fitz.Pixmap(doc, xref)
-                data = pixmap_to_webp_bytes(pix, quality)
-                dest = resources_dir / f"img_{counter:0{pad}d}.webp"
-                dest.write_bytes(data)
-                counter += 1
-            except Exception:
-                pass   # skip unreadable images silently
 
 
 # ---------------------------------------------------------------------------
@@ -175,15 +139,15 @@ def extract_texts(doc: fitz.Document) -> list:
 # ---------------------------------------------------------------------------
 
 def _progress(label: str, done: int, total: int) -> None:
-    bar_w = 30
+    bar_w  = 30
     filled = int(bar_w * done / total)
-    bar = "#" * filled + "." * (bar_w - filled)
-    pct = 100 * done // total
+    bar    = "#" * filled + "." * (bar_w - filled)
+    pct    = 100 * done // total
     print(f"\r  {label}: [{bar}] {pct:3d}%  {done}/{total}", end="", flush=True)
 
 
 # ---------------------------------------------------------------------------
-# HTML generation
+# HTML generation — all images are embedded as base64 data URIs
 # ---------------------------------------------------------------------------
 
 def build_html(
@@ -195,15 +159,12 @@ def build_html(
     title = pdf_path.stem
     total = len(page_meta)
 
-    def rel(p: Path) -> str:
-        return str(p.relative_to(output_html.parent)).replace("\\", "/")
-
-    # Compact JSON manifest for the JS lazy-loader
+    # Build manifest — src is already a data URI, no relative path needed
     manifest = [
         {
-            "src": rel(m["path"]),
-            "w": m["width"],
-            "h": m["height"],
+            "src": m["src"],
+            "w":   m["width"],
+            "h":   m["height"],
             "text": (
                 page_texts[i]
                 .replace("&", "&amp;")
@@ -327,7 +288,6 @@ def build_html(
       position: relative;
       width: 100%;
     }}
-    /* Transparent spacer holds aspect-ratio before image loads */
     .page-spacer {{
       display: block;
       width: 100%;
@@ -412,6 +372,7 @@ def build_html(
 
 <footer>
   Converted from <strong>{pdf_path.name}</strong> &nbsp;&middot;&nbsp; {total} pages
+  &nbsp;&middot;&nbsp; self-contained (no external files)
 </footer>
 
 <script>
@@ -423,7 +384,6 @@ def build_html(
   var loadedCount = 0;
   var currentPage = 1;
 
-  // Build all page cards (images NOT loaded yet — src intentionally blank)
   var main = document.getElementById('main');
   var frag = document.createDocumentFragment();
 
@@ -439,7 +399,7 @@ def build_html(
     var inner = document.createElement('div');
     inner.className = 'page-inner';
 
-    // Transparent 1x1 gif as spacer — sets the aspect ratio without a request
+    // Transparent spacer holds aspect ratio before the image fades in
     var spacer = document.createElement('img');
     spacer.className = 'page-spacer';
     spacer.alt = '';
@@ -452,7 +412,7 @@ def build_html(
     img.className = 'page-img';
     img.alt = 'Page ' + pageNum;
     img.decoding = 'async';
-    // src deliberately NOT set here
+    // src is set by the IntersectionObserver below (lazy load from data URI)
 
     img.addEventListener('load', (function(im) {{
       return function() {{
@@ -485,7 +445,7 @@ def build_html(
 
   main.appendChild(frag);
 
-  // Intersection Observer: load image when page enters viewport (+ 200% margin ahead)
+  // Lazy-load: assign the data URI only when the page scrolls into view
   var io = new IntersectionObserver(function(entries) {{
     entries.forEach(function(entry) {{
       if (!entry.isIntersecting) return;
@@ -493,7 +453,7 @@ def build_html(
       var img = section.querySelector('.page-img');
       if (img && !img.src) {{
         var idx = parseInt(section.dataset.index, 10);
-        img.src = PAGES[idx].src;
+        img.src = PAGES[idx].src;   // data URI — no network request
       }}
       io.unobserve(section);
     }});
@@ -511,7 +471,7 @@ def build_html(
     }}
   }}
 
-  // Current-page tracker (fires when page crosses screen centre)
+  // Current-page tracker
   var pageCounter = document.getElementById('page-counter');
   var pageIO = new IntersectionObserver(function(entries) {{
     entries.forEach(function(entry) {{
@@ -531,14 +491,12 @@ def build_html(
     var el = document.getElementById('page-' + n);
     if (el) {{
       el.scrollIntoView({{ behavior: 'smooth', block: 'start' }});
-      // Pre-load immediately without waiting for IO
       var img = el.querySelector('.page-img');
       if (img && !img.src) img.src = PAGES[n - 1].src;
     }}
     input.value = '';
   }};
 
-  // Enter key in jump input
   document.getElementById('jump-input').addEventListener('keydown', function(e) {{
     if (e.key === 'Enter') jumpToPage();
   }});
@@ -584,7 +542,7 @@ def build_html(
 # Entry point
 # ---------------------------------------------------------------------------
 
-def convert(pdf_path_str, dpi, quality, workers, skip_images):
+def convert(pdf_path_str, dpi, quality, workers):
     pdf_path = Path(pdf_path_str).expanduser().resolve()
 
     if not pdf_path.exists():
@@ -592,16 +550,12 @@ def convert(pdf_path_str, dpi, quality, workers, skip_images):
     if pdf_path.suffix.lower() != ".pdf":
         sys.exit(f"ERROR: Not a PDF file: {pdf_path}")
 
-    output_dir    = pdf_path.parent
-    resources_dir = output_dir / "resources"
-    output_html   = output_dir / (pdf_path.stem + ".html")
+    output_html = pdf_path.parent / (pdf_path.stem + ".html")
 
     print(f"\n  PDF     : {pdf_path.name}")
     print(f"  Output  : {output_html}")
-    print(f"  Assets  : {resources_dir}/")
+    print(f"  Mode    : self-contained (base64 embedded images)")
     print(f"  DPI={dpi}  quality={quality}  workers={'auto' if workers is None else workers}\n")
-
-    ensure_dir(resources_dir)
 
     print("Opening PDF ...")
     doc = fitz.open(str(pdf_path))
@@ -610,18 +564,12 @@ def convert(pdf_path_str, dpi, quality, workers, skip_images):
 
     print("Extracting text ...")
     page_texts = extract_texts(doc)
-
-    if not skip_images:
-        print("\nExtracting embedded images ...")
-        extract_embedded_images(doc, resources_dir, total_pages, quality)
-        print()
-
     doc.close()   # close before parallel render (workers open their own handles)
 
-    print("Rendering pages -> WebP ...")
-    page_meta = render_pages_parallel(pdf_path, resources_dir, total_pages, dpi, quality, workers)
+    print("Rendering pages -> WebP (in memory) ...")
+    page_meta = render_pages_parallel(pdf_path, total_pages, dpi, quality, workers)
 
-    print("Building HTML ...")
+    print("Building self-contained HTML ...")
     build_html(pdf_path, page_meta, page_texts, output_html)
 
     size_mb = output_html.stat().st_size / 1_048_576
@@ -631,17 +579,16 @@ def convert(pdf_path_str, dpi, quality, workers, skip_images):
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Convert a PDF to a browser-viewable HTML file. Optimised for large PDFs.",
+        description="Convert a PDF to a fully self-contained HTML file (base64 embedded images).",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
-    parser.add_argument("pdf",           help="Path to the input PDF file")
-    parser.add_argument("--dpi",         type=int, default=DEFAULT_DPI,     help="Render resolution")
-    parser.add_argument("--quality",     type=int, default=DEFAULT_QUALITY, help="WebP quality 0-100")
-    parser.add_argument("--workers",     type=int, default=None,            help="Parallel workers (default: CPU count)")
-    parser.add_argument("--skip-images", action="store_true",               help="Skip embedded image extraction")
+    parser.add_argument("pdf",         help="Path to the input PDF file")
+    parser.add_argument("--dpi",       type=int, default=DEFAULT_DPI,     help="Render resolution")
+    parser.add_argument("--quality",   type=int, default=DEFAULT_QUALITY, help="WebP quality 0-100")
+    parser.add_argument("--workers",   type=int, default=None,            help="Parallel workers (default: CPU count)")
     args = parser.parse_args()
 
-    convert(args.pdf, args.dpi, args.quality, args.workers, args.skip_images)
+    convert(args.pdf, args.dpi, args.quality, args.workers)
 
 
 if __name__ == "__main__":
